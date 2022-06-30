@@ -45,6 +45,10 @@ contract Staking is Ownable {
         startTime = _startTime;
     }
 
+    function stakeOf(address _stakeholder) external view returns(uint256) {
+        return stakes[_stakeholder].amount;
+    }
+
     function createStake(uint128 amount) external {
         usdt.transferFrom(msg.sender, address(this), amount);
         uint256 stakeTime = block.timestamp;
@@ -60,8 +64,9 @@ contract Staking is Ownable {
         } else {
             stakeholders[_index] = stakeholders[stakeholders.length - 1];
             stakeholders.pop();
-            delete stakes[msg.sender];
+            
         }
+        delete stakes[msg.sender];
     }
 
     function calculateReward() internal whenStakingInProgress {
