@@ -2,8 +2,9 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 
-contract Staking is Ownable {
+contract Staking is Ownable, Pausable {
     
     IERC20 usdt;
     IERC20 ttt;
@@ -11,24 +12,32 @@ contract Staking is Ownable {
     uint256 constant CYCLE = 1 days;
     uint256 constant DAILY_REWARDS = 1000;
 
-    struct Stake {
-        uint256 timestamp;
-        uint128 amount;
-        uint256 index;
+    struct Staker {
+        uint256 stakeAmount;
+        uint256 stakeTime;
+        uint256 rewardAllowed;
+        uint256 rewardDebt;
+        uint256 distributed;
+        uint256 unstakeAmount;
+        uint256 unstakeTime;
     }
-    struct Reward {
-        uint256 timestamp;
-        uint256 amount;
-    }
 
-    mapping (address => Stake) stakes;
-    mapping (address => Reward) rewards;
-
-    address[] stakeholders;
-
+    mapping(address => Staker) public stakers;
+    
     uint256 startTime;
     uint256 endTime;
     uint256 nextPay;
+    uint256 stakeTimestamp;
+
+    uint256 public rewardTotal;
+    uint256 public unstakeLockTime;
+    uint256 public totalStaked;
+    uint256 public totalDistributed;
+
+    uint256 public tokensPerStake;
+    uint256 public allProduced;
+    uint256 public produceTime;
+    uint256 public rewardProduced;
 
     modifier whenStakingInProgress () {
         uint256 currentTime = block.timestamp;
@@ -43,49 +52,121 @@ contract Staking is Ownable {
 
     function start(uint256 _startTime) external onlyOwner {
         startTime = _startTime;
+        endTime = startTime + 30 days;
     }
 
-    function stakeOf(address _stakeholder) external view returns(uint256) {
-        return stakes[_stakeholder].amount;
+    function produced() internal view returns (uint256) {
+        return allProduced + (rewardTotal * (block.timestamp - produceTime) / CYCLE);
     }
 
-    function createStake(uint128 amount) external {
-        usdt.transferFrom(msg.sender, address(this), amount);
-        uint256 stakeTime = block.timestamp;
-        stakeholders.push(msg.sender);
-        stakes[msg.sender] = Stake(stakeTime, amount, stakeholders.length);
+    function updateReward() public whenStakingInProgress {
+        uint256 rewardProducedAtNow = produced();
+        if (rewardProducedAtNow > rewardProduced) {
+            uint256 producedNew = rewardProducedAtNow - rewardProduced;
+            if (totalStaked > 0) {
+                tokensPerStake = tokensPerStake + 
+                    (producedNew / totalStaked);
+            }
+            rewardProduced = rewardProduced + producedNew;
+        }
     }
 
-    function removeStake(uint128 amount) external {
+    function stake(uint128 _amount) external returns (uint256) {
+        usdt.transferFrom(msg.sender, address(this), _amount);
+        Staker storage staker = stakers[msg.sender];
+        if(totalStaked > 0) {
+            updateReward();
+        }
+        totalStaked += _amount;
+        staker.stakeAmount += _amount;
+        staker.rewardDebt += _amount * tokensPerStake;
+        staker.stakeTime = block.timestamp;
+        return staker.stakeTime;
+    }
+
+    function unstake(uint256 _amount) public {
+        Staker storage staker = stakers[msg.sender];
+
+        require(
+            staker.stakeAmount >= _amount,
+            "Staking: Not enough tokens to unstake"
+        );
+
+        updateReward();
+
+        staker.rewardAllowed += _amount * tokensPerStake;
+
+        staker.stakeAmount -= _amount;
+        totalStaked -= _amount;
+
+        staker.unstakeAmount += _amount;
+        staker.unstakeTime = unstakeLockTime + block.timestamp;
+
+    }
+
+    function withdraw() public {
+        Staker storage staker = stakers[msg.sender];
+
+        require(
+            staker.unstakeAmount > 0,
+            "Staking: Not enough tokens to unstake"
+        );
+
+        require(
+            block.timestamp >= staker.unstakeTime,
+            "Staking: Unstaked tokens are not available yet."
+        );
+
+        uint256 amount = staker.unstakeAmount;
+        staker.unstakeAmount = 0;
+        staker.unstakeTime = 0;
         usdt.transfer(msg.sender, amount);
-        uint256 _index = stakes[msg.sender].index;
-        if (_index == stakeholders.length - 1) {
-            stakeholders.pop();
-        } else {
-            stakeholders[_index] = stakeholders[stakeholders.length - 1];
-            stakeholders.pop();
-            
-        }
-        delete stakes[msg.sender];
     }
 
-    function calculateReward() internal whenStakingInProgress {
-        uint256 totalRewards;
-        uint256 currentTime = block.timestamp;
-        for (uint256 i= 0; i < stakeholders.length; i++) {
-            totalRewards += stakes[stakeholders[i]].amount;
+    function claim() public returns (bool) {
+        if (totalStaked > 0) {
+            updateReward();
         }
-        uint256 reward = (stakes[msg.sender].amount / totalRewards) * DAILY_REWARDS * 
-        (stakes[msg.sender].timestamp / (currentTime - rewards[msg.sender].timestamp + CYCLE));
-        rewards[msg.sender] = Reward(currentTime, reward);
+
+        uint256 reward = calculateReward(msg.sender, tokensPerStake);
+        require(reward > 0, "Staking: Nothing to claim");
+
+        Staker storage staker = stakers[msg.sender];
+
+        staker.distributed += reward;
+        totalDistributed += reward;
+
+        ttt.transfer(msg.sender, reward);
+        return true;
     }
 
-    function getReward() external {
-        require (stakeholders[stakes[msg.sender].index] == msg.sender);
-        uint256 rewardAmount = rewards[msg.sender].amount;
-        if ((block.timestamp - rewards[msg.sender].timestamp) > CYCLE) {
-            calculateReward();    
+    function claimAndUnstake() public {
+        Staker storage staker = stakers[msg.sender];
+        unstake(staker.stakeAmount);
+
+        uint256 reward = getReward(msg.sender);
+        if (reward > 0) {
+            claim();
         }
-        ttt.transfer(msg.sender, rewardAmount);
     }
-}
+
+    function calculateReward(address _staker, uint256 _tps) internal view returns (uint256 reward) {
+        Staker storage staker = stakers[_staker];
+        reward = staker.stakeAmount * _tps;
+        return reward;
+    }
+
+    function getReward(address _staker) public view returns (uint256 reward) {
+        uint256 tps = tokensPerStake;
+        if (totalStaked > 0) {
+            uint256 rewardProducedAtNow = produced();
+            if (rewardProducedAtNow > rewardProduced) {
+                uint256 producedNew = rewardProducedAtNow - rewardProduced;
+                tps += producedNew / totalStaked;
+            }
+        }
+        reward = calculateReward(_staker, tps);
+
+        return reward;
+    }
+  }
